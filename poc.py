@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Reproduce the verifier-only interleaving before and after k binding.
 
-Run: python3 protocol_harness.py [--quiet] [--repeat N]
+Run: python3 poc.py [--quiet] [--repeat N]
 Python 3.9+; standard library only.
 
 Layout: shared operations and model support; endpoint processing and
