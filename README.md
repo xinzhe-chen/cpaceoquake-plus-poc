@@ -40,6 +40,15 @@ Both endpoints apply the same change:
 +h1 = Extract(SK, DST || "h1" || public_context || enc_c || k)
 ```
 
+## Read the code
+
+The single script has five numbered sections: confirmation formulas and
+ideal primitives; endpoint state machines; the two-session interleaver;
+the matching-session observer and four tests; and the command-line runner.
+Start with `test_baseline_interleaving` and `test_hardened_interleaving`
+for the before/after assertions. `run_honest_handshake` and the interleaver
+show individual messages as `msg1` through `msg5`.
+
 ## Model scope
 
 The attacker obtains `v`, but not `pk_reg`, the password, or client
