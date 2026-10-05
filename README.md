@@ -1,22 +1,20 @@
 # CPaceOQUAKE+ authentication PoC
 
-Companion to **draft-chen-cfrg-pqpake-authentication-00**, an individual
-Informational Internet-Draft by Xinzhe Chen, National University of Singapore.
+A standalone before/after reproducer of the verifier-only interleaving
+from the [CFRG discussion](https://mailarchive.ietf.org/arch/msg/cfrg/G_tFVXIi_mmuq2EXRZYJ1acL36w/)
+for [draft-vos-cfrg-pqpake-02](https://www.ietf.org/archive/id/draft-vos-cfrg-pqpake-02.html).
+It compares the baseline with the proposed binding of the registered-KEM
+shared secret `k` into the confirmation checked by the client.
 
-The PoC reproduces the verifier-only interleaving from the
-[CFRG discussion](https://mailarchive.ietf.org/arch/msg/cfrg/G_tFVXIi_mmuq2EXRZYJ1acL36w/)
-against [draft-vos-cfrg-pqpake-02](https://www.ietf.org/archive/id/draft-vos-cfrg-pqpake-02.html),
-and repeats it with the proposed confirmation binding.
+## Run
 
-## Reproduce
-
-Python 3.9+; no dependencies or installation.
+Python 3.9+; standard library only. No installation or dependencies.
 
 ```sh
 python3 protocol_harness.py
 ```
 
-The single script prints state transitions and checks four scenarios:
+The script prints state transitions and checks four scenarios:
 
 | Scenario | Expected result |
 |---|---|
@@ -25,41 +23,30 @@ The single script prints state transitions and checks four scenarios:
 | Hardened, honest handshake | Both accept with the same key and a matching server session |
 | Hardened, same interleaving | Client rejects with `AuthenticationError` and exposes no key |
 
-All four should print **PASS**: the second PASS means the baseline gap was
-reproduced; the fourth means the hardened client rejected the attack.
-Failed checks return a nonzero exit status. Optional repeated comparison:
+All four should print **PASS**. The second PASS means the baseline gap
+was reproduced; the fourth means the hardened client rejected the attack.
+Failed checks return a nonzero exit status. To repeat the comparison:
 
 ```sh
 python3 protocol_harness.py --quiet --repeat 100
 ```
 
-The only confirmation change, applied at both endpoints, is:
+## Confirmation change
+
+Both endpoints apply the same change:
 
 ```diff
 -h1 = Extract(SK, DST || "h1" || public_context || enc_c)
 +h1 = Extract(SK, DST || "h1" || public_context || enc_c || k)
 ```
 
-**Model:** the attacker obtains `v`, but not `pk_reg`, the password, or
-client private material. PAKE and KEM operations are ideal opaque
-functionalities; HKDF, masking and confirmation checks are concrete.
-This demonstrates the stated trace, not a full protocol security proof.
+## Model scope
 
-## Draft
-
-- [Markdown source](draft-chen-cfrg-pqpake-authentication-00.md)
-- [HTML reading edition](rendered/draft-chen-cfrg-pqpake-authentication-00.html)
-- [Submission text](rendered/draft-chen-cfrg-pqpake-authentication-00.txt)
-- [RFCXML](rendered/draft-chen-cfrg-pqpake-authentication-00.xml)
-
-For Chrome, open the generated **HTML** locally (download it if viewing
-on GitHub). Ordinary Markdown previews do not parse kramdown-rfc markers.
-The draft has not been submitted to IETF.
-
-To rebuild these editions, install `kramdown-rfc` and `xml2rfc`, then run
-`make`. These authoring tools are not needed to run the PoC.
-
-The layout follows the root draft/README/Makefile convention used by
-[PQPAKE](https://github.com/chris-wood/draft-pqpake) and
-[OPAQUE](https://github.com/cfrg/draft-irtf-cfrg-opaque), with one standalone
-Python reproducer and the generated reading editions in `rendered/`.
+The attacker obtains `v`, but not `pk_reg`, the password, or client
+private material. PAKE and KEM operations are ideal opaque functionalities;
+HKDF, masking and confirmation checks are concrete. A matching server
+must have prepared its response before client acceptance; it need not
+have received the final message. The patch does not protect against
+exposure of both `v` and `pk_reg`. This finite simulation demonstrates
+the stated trace, not a full protocol security proof or a production
+post-quantum implementation.
