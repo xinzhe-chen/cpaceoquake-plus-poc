@@ -2,22 +2,18 @@
 """Reproduce the verifier-only interleaving before and after k binding.
 
 Run: python3 poc.py [--quiet] [--repeat N]
-Python 3.9+; standard library only.
+Python 3.12+; install requirements.txt first.
 
-Layout: shared operations and model support; endpoint processing and
-protocol interactions; comparison tests and the command-line runner.
+CPace P-256, OQUAKE with KemeleonNR/ML-KEM-1024, registered X-Wing,
+Scrypt and HKDF-SHA256 run concrete cryptography and byte messages.
+The attacker receives only v and uses public algorithms and wire data.
+This executable research reproducer is not a security proof or production
+implementation; Python field arithmetic is not constant-time.
 
-CPace/OQUAKE and the registered KEM are ideal functionalities with opaque
-capabilities. HKDF-SHA256, ciphertext masking, confirmation checks and
-endpoint state transitions are concrete. The attacker receives only v;
-it cannot read endpoint secrets or the ideal registries. This is a model
-contract, not isolation against arbitrary Python introspection.
-
-Source: draft-vos-cfrg-pqpake-02, Sections 9.2 and 9.4, and
-https://mailarchive.ietf.org/arch/msg/cfrg/G_tFVXIi_mmuq2EXRZYJ1acL36w/
-This finite simulation is not a concrete PQ implementation or a security
-proof. A matching server must have started its confirmation response
-before client acceptance; it need not have received the final message.
+Source: draft-vos-cfrg-pqpake-02, Sections 8, 9 and 10. See README for
+explicit resolutions of inconsistent pseudocode and encoding sizes.
+A matching server must have produced its confirmation response before
+client acceptance; it need not have received the final message.
 """
 
 from __future__ import annotations
@@ -28,25 +24,27 @@ import hmac
 import secrets
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
+
+from crypto import (
+    AuthenticationError, CPaceState, OQUAKEState, DST, NCT, NKC, NKEY,
+    OQUAKE_INIT_LEN, OQUAKE_RESP_LEN, cpace_init, cpace_respond, cpace_finish,
+    oquake_init, oquake_respond, oquake_finish, xwing_public_key,
+    xwing_encapsulate, xwing_decapsulate, verifier_material,
+    hkdf_extract, hkdf_expand, xor, verify_confirmation, require_bytes, lv_encode,
+)
 
 
 # ------------------------------------------------------------------------
-# 1. Shared definitions, operations, and model support
+# 1. Shared definitions, operations, and observation
 # ------------------------------------------------------------------------
 
 MODE_BASELINE = "baseline"
 MODE_HARDENED = "hardened"
 MODES = (MODE_BASELINE, MODE_HARDENED)
-HASH_LEN = NCT = NKC = NKEY = 32
-# Illustrative suite domain; not an interoperable CPaceOQUAKE+ ciphersuite.
-DST = b"pqpake-authentication-harness-v1/"
-
-
-# Data types and states
-
-class AuthenticationError(Exception):
-    """A confirmation, ideal credential check, or decapsulation failed."""
+HASH_LEN = 32
+CPACE_MESSAGE_LEN = 32 + 1 + 65  # s_i || lv_encode(uncompressed P-256 share)
+CONFIRMATION_MESSAGE_LEN = OQUAKE_RESP_LEN + NCT + NKC
 
 
 class StateError(Exception):
@@ -64,22 +62,6 @@ class State(Enum):
 
 
 @dataclass(frozen=True, repr=False)
-class _InitiatorCapability:
-    token: bytes
-    private_capability: bytes
-
-
-@dataclass(frozen=True, repr=False)
-class _PublicKey:
-    capability: bytes
-
-
-@dataclass(frozen=True, repr=False)
-class _PrivateKey:
-    capability: bytes
-
-
-@dataclass(frozen=True, repr=False)
 class ClientCredentials:
     verifier: bytes
     seed: bytes
@@ -88,24 +70,7 @@ class ClientCredentials:
 @dataclass(frozen=True, repr=False)
 class ServerCredentials:
     verifier: bytes
-    registered_public_key: _PublicKey
-
-
-@dataclass(frozen=True)
-class Offer:
-    token: bytes
-
-
-@dataclass(frozen=True)
-class CPaceReply:
-    token: bytes
-
-
-@dataclass(frozen=True)
-class ConfirmationReply:
-    oquake_token: bytes
-    enc_c: bytes
-    client_confirm: bytes
+    registered_public_key: bytes
 
 
 @dataclass(frozen=True, repr=False)
@@ -135,43 +100,46 @@ class Witness:
 
 # Cryptographic operations
 
-def hkdf_extract(salt: bytes, ikm: bytes) -> bytes:
-    """HKDF-Extract with SHA-256, taking (salt, IKM) in draft order."""
-    return hmac.new(salt, ikm, hashlib.sha256).digest()
-
-
-def hkdf_expand(prk: bytes, info: bytes, length: int) -> bytes:
-    """RFC 5869 HKDF-Expand with SHA-256."""
-    if not 0 <= length <= 255 * HASH_LEN:
-        raise ValueError("HKDF output length out of range")
-    output, previous = b"", b""
-    for counter in range(1, (length + HASH_LEN - 1) // HASH_LEN + 1):
-        previous = hmac.new(prk, previous + info + bytes([counter]),
-                            hashlib.sha256).digest()
-        output += previous
-    return output[:length]
-
-
-def xor(left: bytes, right: bytes) -> bytes:
-    if len(left) != len(right):
-        raise ValueError("XOR inputs must have equal lengths")
-    return bytes(a ^ b for a, b in zip(left, right))
-
-
 def frame(*fields: bytes) -> bytes:
-    """Unambiguous framing for observer transcripts and ideal inputs."""
+    """Four-byte big-endian lengths for public context and observer data."""
     return b"".join(len(item).to_bytes(4, "big") + item for item in fields)
 
 
 def build_public_context(client_id: str, server_id: str) -> bytes:
-    """Public identities and experiment context shared by both endpoints."""
-    return frame(client_id.encode(), server_id.encode(),
-                 b"authentication-semantics experiment")
+    # Section 8: EncodePublicContext(sid, U, S), using an empty application sid.
+    return frame(b"", client_id.encode(), server_id.encode())
+
+
+def decode_cpace_message(message: bytes) -> Tuple[bytes, bytes]:
+    require_bytes(message, CPACE_MESSAGE_LEN, "CPace composition message")
+    # The selected suite has a fixed 65-byte point, whose LEB128 prefix is 0x41.
+    if message[32:33] != b"\x41":
+        raise AuthenticationError("invalid CPace length prefix")
+    return message[:32], message[33:]
+
+
+def begin_cpace(verifier: bytes, context: bytes) -> Tuple[CPaceState, bytes]:
+    state, point = cpace_init(verifier, context)
+    return state, secrets.token_bytes(32) + lv_encode(point)
+
+
+def respond_cpace(verifier: bytes, context: bytes, message: bytes
+                  ) -> Tuple[bytes, bytes]:
+    _, point = decode_cpace_message(message)
+    reply, key = cpace_respond(verifier, context, point)
+    return secrets.token_bytes(32) + lv_encode(reply), key
+
+
+def finish_cpace(state: CPaceState, message: bytes) -> bytes:
+    _, point = decode_cpace_message(message)
+    return cpace_finish(state, point)
 
 
 def bind_cpace_context(public_context: bytes, offer: bytes, reply: bytes) -> bytes:
-    """Bind the OQUAKE stage to the preceding CPace exchange."""
-    return frame(offer, reply) + public_context
+    s1, _ = decode_cpace_message(offer)
+    s2, _ = decode_cpace_message(reply)
+    prk = hkdf_extract(s1 + s2, DST + b"CPaceOQUAKE")
+    return hkdf_expand(prk, DST + b"SID", 32) + public_context
 
 
 def ciphertext_pad(sk: bytes) -> bytes:
@@ -186,12 +154,6 @@ def mask_ciphertext(sk: bytes, ciphertext: bytes) -> bytes:
 def unmask_ciphertext(sk: bytes, enc_c: bytes) -> bytes:
     """Recover the ciphertext; this operation does not recover its secret k."""
     return xor(enc_c, ciphertext_pad(sk))
-
-
-def verify_confirmation(expected: bytes, received: bytes, label: str) -> None:
-    """Compare a confirmation in constant time, or raise authentication failure."""
-    if not hmac.compare_digest(expected, received):
-        raise AuthenticationError(label + " mismatch")
 
 
 def derive_client_confirmation(mode: str, sk: bytes, context: bytes,
@@ -218,109 +180,12 @@ def derive_server_confirmation_and_key(sk: bytes, context: bytes,
             hkdf_expand(prk, DST + b"key", NKEY))
 
 
-class IdealPAKE:
-    """Ideal lower PAKE branch; same verifier/context is a precondition.
-
-    begin/respond/finish model the CPace and OQUAKE interfaces without
-    implementing their group operations, password masking, BUA-sKEM,
-    intermediate confirmation, or concrete serialized messages.
-    """
-
-    def __init__(self) -> None:
-        self.__offers: Dict[bytes, Tuple[bytes, bytes, bytes]] = {}
-        self.__responses: Dict[bytes, Tuple[bytes, bytes]] = {}
-
-    @staticmethod
-    def _binding(stage: bytes, verifier: bytes, context: bytes,
-                 secret_context: bytes) -> bytes:
-        return hashlib.sha256(frame(stage, verifier, context,
-                                    secret_context)).digest()
-
-    def begin(self, stage: bytes, verifier: bytes, context: bytes,
-              secret_context: bytes) -> Tuple[_InitiatorCapability, bytes]:
-        token, capability = secrets.token_bytes(32), secrets.token_bytes(32)
-        self.__offers[token] = (capability,
-                               self._binding(stage, verifier, context,
-                                             secret_context), stage)
-        return _InitiatorCapability(token, capability), token
-
-    def respond(self, stage: bytes, verifier: bytes, context: bytes,
-                secret_context: bytes, offer: bytes) -> Tuple[bytes, bytes]:
-        record = self.__offers.get(offer)
-        binding = self._binding(stage, verifier, context, secret_context)
-        if record is None or not hmac.compare_digest(record[1], binding):
-            raise AuthenticationError("ideal lower PAKE binding mismatch")
-        response, shared = secrets.token_bytes(32), secrets.token_bytes(32)
-        self.__responses[response] = (offer, shared)
-        return response, shared
-
-    def finish(self, capability: _InitiatorCapability, response: bytes) -> bytes:
-        offer = self.__offers.get(capability.token)
-        record = self.__responses.get(response)
-        if (offer is None or record is None or record[0] != capability.token
-                or not hmac.compare_digest(offer[0],
-                                           capability.private_capability)):
-            raise AuthenticationError("ideal lower PAKE response mismatch")
-        return record[1]
-
-
-class IdealKEM:
-    """Opaque ciphertext registry; c does not encode k or pk.
-
-    derive_key_pair requires the hidden seed, encapsulate requires the
-    registered public-key capability, and decapsulate requires its private
-    counterpart. Decapsulation rejects unknown/wrong-owner ciphertexts.
-    Concrete KEM implicit-rejection behavior is outside this abstraction.
-    No registry-reading method is exposed to the interleaver.
-    """
-
-    def __init__(self) -> None:
-        self.__seeds: Dict[bytes, Tuple[_PublicKey, _PrivateKey]] = {}
-        self.__pairs: Dict[bytes, bytes] = {}
-        self.__ciphertexts: Dict[bytes, Tuple[bytes, bytes]] = {}
-
-    def derive_key_pair(self, seed: bytes) -> Tuple[_PublicKey, _PrivateKey]:
-        if seed not in self.__seeds:
-            public = _PublicKey(secrets.token_bytes(32))
-            private = _PrivateKey(secrets.token_bytes(32))
-            self.__seeds[seed] = (public, private)
-            self.__pairs[public.capability] = private.capability
-        return self.__seeds[seed]
-
-    def encapsulate(self, public: _PublicKey) -> Tuple[bytes, bytes]:
-        if not isinstance(public, _PublicKey):
-            raise AuthenticationError("registered public-key capability absent")
-        private = self.__pairs.get(public.capability)
-        if private is None:
-            raise AuthenticationError("unknown public-key capability")
-        ciphertext, shared = secrets.token_bytes(NCT), secrets.token_bytes(32)
-        self.__ciphertexts[ciphertext] = (private, shared)
-        return ciphertext, shared
-
-    def decapsulate(self, private: _PrivateKey, ciphertext: bytes) -> bytes:
-        record = self.__ciphertexts.get(ciphertext)
-        if (not isinstance(private, _PrivateKey) or record is None
-                or not hmac.compare_digest(record[0], private.capability)):
-            raise AuthenticationError("ideal KEM decapsulation failed")
-        return record[1]
-
-
-def register(kem: IdealKEM, password: bytes, salt: bytes,
-             client_id: str, server_id: str
+def register(password: bytes, salt: bytes, client_id: str, server_id: str
              ) -> Tuple[ClientCredentials, ServerCredentials]:
-    """Illustrative KSF, preserving the verifier/seed split of Section 9.1.
-
-    The caller retains password only for fixture construction. The server
-    credential record contains verifier and pk, never seed/password/sk.
-    This low iteration count is for simulation, not production password use.
-    """
-    material = hashlib.pbkdf2_hmac(
-        "sha256", frame(DST, password, client_id.encode(), server_id.encode()),
-        salt, 1000, dklen=64)
-    verifier, seed = material[:32], material[32:]
-    public, _ = kem.derive_key_pair(seed)
+    verifier, seed = verifier_material(password, salt, client_id.encode(),
+                                       server_id.encode())
     return (ClientCredentials(verifier, seed),
-            ServerCredentials(verifier, public))
+            ServerCredentials(verifier, xwing_public_key(seed)))
 
 
 # Logging, observation, and test setup
@@ -365,13 +230,11 @@ class Observer:
 
 
 class Endpoint:
-    def __init__(self, session: str, mode: str, lower: IdealPAKE,
-                 kem: IdealKEM, observer: Observer, trace: Trace,
+    def __init__(self, session: str, mode: str, observer: Observer, trace: Trace,
                  client_id: str = "alice", server_id: str = "server.example"):
         if mode not in MODES:
             raise ValueError("unknown confirmation mode")
         self.session, self.mode = session, mode
-        self._lower, self._kem = lower, kem
         self._observer, self._trace = observer, trace
         self._identities = (client_id, server_id)
         self._base_context = build_public_context(client_id, server_id)
@@ -396,14 +259,11 @@ class Endpoint:
         self._move(State.ABORT, reason)
         raise AuthenticationError(reason)
 
-    def _check(self, value: object, message_type: type,
-               field_names: Tuple[str, ...]) -> None:
-        if not isinstance(value, message_type):
-            self._reject("unexpected message type")
-        for name in field_names:
-            item = getattr(value, name)
-            if not isinstance(item, bytes) or len(item) != 32:
-                self._reject("invalid message length/type: " + name)
+    def _check(self, message: bytes, length: int, label: str) -> None:
+        try:
+            require_bytes(message, length, label)
+        except AuthenticationError as error:
+            self._reject(str(error))
 
     def _witness(self, role: str) -> Witness:
         assert self._sk is not None and self.key is not None
@@ -415,33 +275,31 @@ class Endpoint:
 
 @dataclass
 class Fixture:
-    """Fresh registration, ideal services, and observer for one test."""
+    """Fresh registration and independent endpoints for one test."""
 
     mode: str
     trace: Trace
-    lower: IdealPAKE = field(default_factory=IdealPAKE)
-    kem: IdealKEM = field(default_factory=IdealKEM)
     observer: Observer = field(default_factory=Observer)
 
     def __post_init__(self) -> None:
         self.client_credentials, self.server_credentials = register(
-            self.kem, secrets.token_bytes(32), secrets.token_bytes(32),
+            secrets.token_bytes(32), secrets.token_bytes(32),
             "alice", "server.example")
         self.public_context = build_public_context("alice", "server.example")
 
     def client(self, label: str = "C1", mode: Optional[str] = None) -> Client:
         return Client(self.client_credentials, session=label,
-                      mode=mode or self.mode, lower=self.lower, kem=self.kem,
+                      mode=mode or self.mode,
                       observer=self.observer, trace=self.trace)
 
     def server(self, label: str = "S1", mode: Optional[str] = None) -> Server:
         return Server(self.server_credentials, session=label,
-                      mode=mode or self.mode, lower=self.lower, kem=self.kem,
+                      mode=mode or self.mode,
                       observer=self.observer, trace=self.trace)
 
     def attacker(self) -> AdversaryInterleaver:
         return AdversaryInterleaver(self.server_credentials.verifier,
-                                   self.lower, self.trace)
+                                   self.trace)
 
 
 def ensure(condition: bool, description: str) -> None:
@@ -477,59 +335,56 @@ class Client(Endpoint):
     def __init__(self, credentials: ClientCredentials, **kwargs):
         super().__init__(**kwargs)
         self._credentials = credentials
-        self._cp_cap: Optional[_InitiatorCapability] = None
-        self._oq_cap: Optional[_InitiatorCapability] = None
+        self._cp_state: Optional[CPaceState] = None
+        self._oq_state: Optional[OQUAKEState] = None
 
-    def initiate(self) -> Offer:
+    def initiate(self) -> bytes:
         self._expect(State.INIT)
-        self._cp_cap, token = self._lower.begin(
-            b"CPace", self._credentials.verifier, self._base_context, b"")
-        self._wire.append(token)
-        self._move(State.MSG1, "send CPace initiation")
-        return Offer(token)
+        self._cp_state, message = begin_cpace(
+            self._credentials.verifier, self._base_context)
+        self._wire.append(message)
+        self._move(State.MSG1, "send CPace initiation (%d bytes)" % len(message))
+        return message
 
-    def receive_cpace(self, reply: CPaceReply) -> Offer:
+    def receive_cpace(self, reply: bytes) -> bytes:
         self._expect(State.MSG1)
-        self._check(reply, CPaceReply, ("token",))
+        self._check(reply, CPACE_MESSAGE_LEN, "CPace reply")
         try:
-            assert self._cp_cap is not None
-            key1 = self._lower.finish(self._cp_cap, reply.token)
-        except AuthenticationError:
-            self._reject("CPace response rejected")
-        self._wire.append(reply.token)
-        self._context = bind_cpace_context(
-            self._base_context, self._wire[0], reply.token)
-        self._move(State.MSG2, "complete ideal CPace shared-secret branch")
-        self._oq_cap, token = self._lower.begin(
-            b"OQUAKE", self._credentials.verifier, self._context, key1)
-        self._wire.append(token)
-        self._move(State.OQUAKE_INIT, "send OQUAKE initiation")
-        return Offer(token)
-
-    def finish(self, reply: ConfirmationReply) -> bytes:
-        self._expect(State.OQUAKE_INIT)
-        self._check(reply, ConfirmationReply,
-                    ("oquake_token", "enc_c", "client_confirm"))
-        self._move(State.CONFIRMATION, "process OQUAKE+ response")
-        try:
-            assert self._oq_cap is not None
-            sk = self._lower.finish(self._oq_cap, reply.oquake_token)
-            ciphertext = unmask_ciphertext(sk, reply.enc_c)
-            _, private = self._kem.derive_key_pair(self._credentials.seed)
-            k = self._kem.decapsulate(private, ciphertext)
-            expected = derive_client_confirmation(
-                self.mode, sk, self._context, reply.enc_c, k)
-            verify_confirmation(expected, reply.client_confirm, "client_confirm")
-            server_confirm, key = derive_server_confirmation_and_key(
-                sk, self._context, reply.enc_c, k)
+            assert self._cp_state is not None
+            key1 = finish_cpace(self._cp_state, reply)
+            self._context = bind_cpace_context(
+                self._base_context, self._wire[0], reply)
         except AuthenticationError as error:
             self._reject(str(error))
+        self._wire.append(reply)
+        self._move(State.MSG2, "complete P-256 CPace")
+        self._oq_state, message = oquake_init(
+            self._credentials.verifier, self._context, key1)
+        self._wire.append(message)
+        self._move(State.OQUAKE_INIT, "send OQUAKE initiation (%d bytes)" % len(message))
+        return message
+
+    def finish(self, reply: bytes) -> bytes:
+        self._expect(State.OQUAKE_INIT)
+        self._check(reply, CONFIRMATION_MESSAGE_LEN, "OQUAKE+ reply")
+        oq_reply = reply[:OQUAKE_RESP_LEN]
+        enc_c = reply[OQUAKE_RESP_LEN:OQUAKE_RESP_LEN + NCT]
+        target = reply[OQUAKE_RESP_LEN + NCT:]
+        self._move(State.CONFIRMATION, "process OQUAKE+ response")
+        try:
+            assert self._oq_state is not None
+            sk = oquake_finish(self._oq_state, oq_reply)
+            k = xwing_decapsulate(self._credentials.seed, unmask_ciphertext(sk, enc_c))
+            expected = derive_client_confirmation(self.mode, sk, self._context, enc_c, k)
+            verify_confirmation(expected, target, "client_confirm")
+            server_confirm, key = derive_server_confirmation_and_key(sk, self._context, enc_c, k)
+        except (AuthenticationError, ValueError) as error:
+            self._reject(str(error))
         self._sk, self.key = sk, key
-        self._wire.extend((reply.oquake_token, reply.enc_c,
-                           reply.client_confirm))
+        self._wire.append(reply)
         self._move(State.ACCEPT, "client_confirm verified; output final key")
         self._observer.record(self._witness("client"))
-        self._trace.log(self.session + ": send server_confirm")
+        self._trace.log(self.session + ": send server_confirm (%d bytes)" % len(server_confirm))
         return server_confirm
 
 
@@ -540,53 +395,46 @@ class Server(Endpoint):
         self._key1: Optional[bytes] = None
         self._server_confirm: Optional[bytes] = None
 
-    def respond_cpace(self, offer: Offer) -> CPaceReply:
+    def respond_cpace(self, offer: bytes) -> bytes:
         self._expect(State.INIT)
-        self._check(offer, Offer, ("token",))
+        self._check(offer, CPACE_MESSAGE_LEN, "CPace initiation")
         try:
-            token, self._key1 = self._lower.respond(
-                b"CPace", self._credentials.verifier, self._base_context,
-                b"", offer.token)
-        except AuthenticationError:
-            self._reject("CPace credential/context mismatch")
-        self._wire.extend((offer.token, token))
-        self._context = bind_cpace_context(
-            self._base_context, offer.token, token)
-        self._move(State.MSG2, "send CPace response")
-        return CPaceReply(token)
+            reply, self._key1 = respond_cpace(
+                self._credentials.verifier, self._base_context, offer)
+            self._context = bind_cpace_context(self._base_context, offer, reply)
+        except AuthenticationError as error:
+            self._reject(str(error))
+        self._wire.extend((offer, reply))
+        self._move(State.MSG2, "send CPace response (%d bytes)" % len(reply))
+        return reply
 
-    def respond_oquake(self, offer: Offer) -> ConfirmationReply:
+    def respond_oquake(self, offer: bytes) -> bytes:
         self._expect(State.MSG2)
-        self._check(offer, Offer, ("token",))
+        self._check(offer, OQUAKE_INIT_LEN, "OQUAKE initiation")
         assert self._key1 is not None
         try:
-            token, sk = self._lower.respond(
-                b"OQUAKE", self._credentials.verifier, self._context,
-                self._key1, offer.token)
-            ciphertext, k = self._kem.encapsulate(
-                self._credentials.registered_public_key)
-        except AuthenticationError:
-            self._reject("OQUAKE or registered-key operation failed")
+            oq_reply, sk = oquake_respond(
+                self._credentials.verifier, self._context, self._key1, offer)
+            ciphertext, k = xwing_encapsulate(self._credentials.registered_public_key)
+        except (AuthenticationError, ValueError) as error:
+            self._reject(str(error))
         enc_c = mask_ciphertext(sk, ciphertext)
-        client_confirm = derive_client_confirmation(
-            self.mode, sk, self._context, enc_c, k)
+        client_confirm = derive_client_confirmation(self.mode, sk, self._context, enc_c, k)
         self._server_confirm, self.key = derive_server_confirmation_and_key(
             sk, self._context, enc_c, k)
         self._sk = sk
-        self._wire.extend((offer.token, token, enc_c, client_confirm))
-        self._move(State.CONFIRMATION, "send confirmation challenge; await reply")
-        # A live matching server witness exists before the final message.
+        reply = oq_reply + enc_c + client_confirm
+        self._wire.extend((offer, reply))
+        self._move(State.CONFIRMATION, "send challenge (%d bytes); await reply" % len(reply))
         self._observer.record(self._witness("server"))
-        return ConfirmationReply(token, enc_c, client_confirm)
+        return reply
 
     def verify(self, server_confirm: bytes) -> bytes:
         self._expect(State.CONFIRMATION)
-        if not isinstance(server_confirm, bytes) or len(server_confirm) != NKC:
-            self._reject("invalid server_confirm length/type")
+        self._check(server_confirm, NKC, "server_confirm")
         assert self._server_confirm is not None
         try:
-            verify_confirmation(self._server_confirm, server_confirm,
-                                "server_confirm")
+            verify_confirmation(self._server_confirm, server_confirm, "server_confirm")
         except AuthenticationError as error:
             self._reject(str(error))
         self._move(State.ACCEPT, "server_confirm verified; output final key")
@@ -595,59 +443,43 @@ class Server(Endpoint):
 
 
 class AdversaryInterleaver:
-    """Verifier-only actor; never reads endpoint or primitive internals."""
+    """Receives only v; runs public algorithms and consumes byte messages."""
 
-    def __init__(self, verifier: bytes, lower: IdealPAKE, trace: Trace):
-        self.__verifier, self.__lower = verifier, lower
-        self.__trace = trace
+    def __init__(self, verifier: bytes, trace: Trace):
+        self.__verifier, self.__trace = verifier, trace
         self.knowledge = {"verifier"}
         self.__ciphertext: Optional[bytes] = None
 
     def obtain_challenge(self, server: Server, public_context: bytes) -> None:
-        """Session 1: act as client, recover c_1, and leave S1 pending."""
-        cpace_state, cpace_token = self.__lower.begin(
-            b"CPace", self.__verifier, public_context, b"")
-        msg1 = Offer(cpace_token)                 # A -> S1
-        msg2 = server.respond_cpace(msg1)         # S1 -> A
-        key1 = self.__lower.finish(cpace_state, msg2.token)
-        context1 = bind_cpace_context(public_context, msg1.token, msg2.token)
-
-        oquake_state, oquake_token = self.__lower.begin(
-            b"OQUAKE", self.__verifier, context1, key1)
-        msg3 = Offer(oquake_token)                # A -> S1
-        msg4 = server.respond_oquake(msg3)        # S1 -> A
-        sk1 = self.__lower.finish(oquake_state, msg4.oquake_token)
-        self.__ciphertext = unmask_ciphertext(sk1, msg4.enc_c)
+        cp_state, msg1 = begin_cpace(self.__verifier, public_context)
+        msg2 = server.respond_cpace(msg1)
+        key1 = finish_cpace(cp_state, msg2)
+        context1 = bind_cpace_context(public_context, msg1, msg2)
+        oq_state, msg3 = oquake_init(self.__verifier, context1, key1)
+        msg4 = server.respond_oquake(msg3)
+        sk1 = oquake_finish(oq_state, msg4[:OQUAKE_RESP_LEN])
+        enc_c = msg4[OQUAKE_RESP_LEN:OQUAKE_RESP_LEN + NCT]
+        self.__ciphertext = unmask_ciphertext(sk1, enc_c)
         self.knowledge.update(("CPace_secret_1", "SK_1", "r_1", "c_1"))
-        self.__trace.log("A / Session 1: knows SK_1 and r_1; recovers opaque c_1")
+        self.__trace.log("A / Session 1: computes SK_1; unmasks X-Wing c_1")
         self.__trace.log("A / Session 1: no seed, pk_reg, k_1, or final key")
 
     def impersonate_server(self, client: Client, public_context: bytes) -> bytes:
-        """Session 2: act as server and translate c_1 into a fresh PAKE context."""
-        msg1 = client.initiate()                  # C2 -> A
-        cpace_token, key1 = self.__lower.respond(
-            b"CPace", self.__verifier, public_context, b"", msg1.token)
-        msg2 = CPaceReply(cpace_token)            # A -> C2
-        msg3 = client.receive_cpace(msg2)         # C2 -> A
-        context2 = bind_cpace_context(public_context, msg1.token, msg2.token)
-        oquake_token, sk2 = self.__lower.respond(
-            b"OQUAKE", self.__verifier, context2, key1, msg3.token)
+        msg1 = client.initiate()
+        msg2, key1 = respond_cpace(self.__verifier, public_context, msg1)
+        msg3 = client.receive_cpace(msg2)
+        context2 = bind_cpace_context(public_context, msg1, msg2)
+        oq_reply, sk2 = oquake_respond(self.__verifier, context2, key1, msg3)
         self.knowledge.update(("CPace_secret_2", "SK_2", "r_2"))
         if self.__ciphertext is None:
             raise StateError("Session 1 challenge has not been obtained")
-        ciphertext = self.__ciphertext
-        # The attacker cannot decapsulate c_1. Try a fresh guessed secret;
-        # Client.finish decides solely by its actual confirmation check.
-        candidate_k = secrets.token_bytes(32)
-        self.__trace.log(
-            "A / Session 2: rewrap c_1 with r_2; recompute client_confirm")
+        candidate_k = secrets.token_bytes(NKEY)
+        self.__trace.log("A / Session 2: rewrap c_1 with r_2; recompute client_confirm")
         if client.mode == MODE_HARDENED:
             self.__trace.log("A / Session 2: k_1 unavailable; use fresh guessed k")
-        enc_c = mask_ciphertext(sk2, ciphertext)
-        forged = derive_client_confirmation(
-            client.mode, sk2, context2, enc_c, candidate_k)
-        msg4 = ConfirmationReply(oquake_token, enc_c, forged)  # A -> C2
-        msg5 = client.finish(msg4)                # C2 -> A, or authentication error
+        enc_c = mask_ciphertext(sk2, self.__ciphertext)
+        forged = derive_client_confirmation(client.mode, sk2, context2, enc_c, candidate_k)
+        msg5 = client.finish(oq_reply + enc_c + forged)
         self.knowledge.add("server_confirm_2")
         return msg5
 
@@ -766,7 +598,7 @@ def main() -> int:
     if args.repeat < 1:
         parser.error("--repeat must be positive")
     print("CPaceOQUAKE+ verifier-only exposure: baseline vs k binding")
-    print("Model: ideal PAKE/KEM; concrete HKDF and confirmation checks")
+    print("Crypto: P-256/Scrypt, KemeleonNR/ML-KEM-1024, X-Wing, HKDF-SHA256")
     passed = failed = 0
     for repetition in range(1, args.repeat + 1):
         for name, test in TESTS:

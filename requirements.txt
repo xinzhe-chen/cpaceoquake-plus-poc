@@ -1,0 +1,2 @@
+cryptography==50.0.1
+ecdsa==0.19.2
