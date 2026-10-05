@@ -4,6 +4,9 @@
 Run: python3 protocol_harness.py [--quiet] [--repeat N]
 Python 3.9+; standard library only.
 
+Layout: shared operations and model support; endpoint processing and
+protocol interactions; comparison tests and the command-line runner.
+
 CPace/OQUAKE and the registered KEM are ideal functionalities with opaque
 capabilities. HKDF-SHA256, ciphertext masking, confirmation checks and
 endpoint state transitions are concrete. The attacker receives only v;
@@ -29,7 +32,7 @@ from typing import Dict, List, Optional, Tuple
 
 
 # ------------------------------------------------------------------------
-# 1. Confirmation formulas and ideal cryptographic operations
+# 1. Shared definitions, operations, and model support
 # ------------------------------------------------------------------------
 
 MODE_BASELINE = "baseline"
@@ -40,6 +43,8 @@ HASH_LEN = NCT = NKC = NKEY = 32
 DST = b"pqpake-authentication-harness-v1/"
 
 
+# Data types and states
+
 class AuthenticationError(Exception):
     """A confirmation, ideal credential check, or decapsulation failed."""
 
@@ -47,6 +52,88 @@ class AuthenticationError(Exception):
 class StateError(Exception):
     """A message was delivered in an invalid local state."""
 
+
+class State(Enum):
+    INIT = "Init"
+    MSG1 = "Msg1 / CPace offer"
+    MSG2 = "Msg2 / CPace response"
+    OQUAKE_INIT = "OQUAKE initiation"
+    CONFIRMATION = "Confirmation / waiting for client"
+    ACCEPT = "Finished / Accept"
+    ABORT = "Abort"
+
+
+@dataclass(frozen=True, repr=False)
+class _InitiatorCapability:
+    token: bytes
+    private_capability: bytes
+
+
+@dataclass(frozen=True, repr=False)
+class _PublicKey:
+    capability: bytes
+
+
+@dataclass(frozen=True, repr=False)
+class _PrivateKey:
+    capability: bytes
+
+
+@dataclass(frozen=True, repr=False)
+class ClientCredentials:
+    verifier: bytes
+    seed: bytes
+
+
+@dataclass(frozen=True, repr=False)
+class ServerCredentials:
+    verifier: bytes
+    registered_public_key: _PublicKey
+
+
+@dataclass(frozen=True)
+class Offer:
+    token: bytes
+
+
+@dataclass(frozen=True)
+class CPaceReply:
+    token: bytes
+
+
+@dataclass(frozen=True)
+class ConfirmationReply:
+    oquake_token: bytes
+    enc_c: bytes
+    client_confirm: bytes
+
+
+@dataclass(frozen=True, repr=False)
+class Witness:
+    """Honest execution metadata used only by the external test observer."""
+
+    session: str
+    role: str
+    identities: Tuple[str, str]
+    mode: str
+    context: bytes
+    transcript: bytes
+    lower_key_commitment: bytes
+    final_key_commitment: bytes
+
+    def matches(self, other: "Witness") -> bool:
+        return (self.role != other.role
+                and self.identities == other.identities
+                and self.mode == other.mode
+                and self.context == other.context
+                and self.transcript == other.transcript
+                and hmac.compare_digest(self.lower_key_commitment,
+                                        other.lower_key_commitment)
+                and hmac.compare_digest(self.final_key_commitment,
+                                        other.final_key_commitment))
+
+
+# Cryptographic operations
 
 def hkdf_extract(salt: bytes, ikm: bytes) -> bytes:
     """HKDF-Extract with SHA-256, taking (salt, IKM) in draft order."""
@@ -76,6 +163,37 @@ def frame(*fields: bytes) -> bytes:
     return b"".join(len(item).to_bytes(4, "big") + item for item in fields)
 
 
+def build_public_context(client_id: str, server_id: str) -> bytes:
+    """Public identities and experiment context shared by both endpoints."""
+    return frame(client_id.encode(), server_id.encode(),
+                 b"authentication-semantics experiment")
+
+
+def bind_cpace_context(public_context: bytes, offer: bytes, reply: bytes) -> bytes:
+    """Bind the OQUAKE stage to the preceding CPace exchange."""
+    return frame(offer, reply) + public_context
+
+
+def ciphertext_pad(sk: bytes) -> bytes:
+    return hkdf_expand(sk, DST + b"OTP", NCT)
+
+
+def mask_ciphertext(sk: bytes, ciphertext: bytes) -> bytes:
+    """Wrap the registered-key ciphertext in the current PAKE session."""
+    return xor(ciphertext, ciphertext_pad(sk))
+
+
+def unmask_ciphertext(sk: bytes, enc_c: bytes) -> bytes:
+    """Recover the ciphertext; this operation does not recover its secret k."""
+    return xor(enc_c, ciphertext_pad(sk))
+
+
+def verify_confirmation(expected: bytes, received: bytes, label: str) -> None:
+    """Compare a confirmation in constant time, or raise authentication failure."""
+    if not hmac.compare_digest(expected, received):
+        raise AuthenticationError(label + " mismatch")
+
+
 def derive_client_confirmation(mode: str, sk: bytes, context: bytes,
                                enc_c: bytes, k: Optional[bytes] = None) -> bytes:
     """Derive the server-sent, client-checked tag using the source h1 schedule."""
@@ -98,12 +216,6 @@ def derive_server_confirmation_and_key(sk: bytes, context: bytes,
     prk = hkdf_extract(sk, DST + b"h2" + context + enc_c + k)
     return (hkdf_expand(prk, DST + b"server_confirm", NKC),
             hkdf_expand(prk, DST + b"key", NKEY))
-
-
-@dataclass(frozen=True, repr=False)
-class _InitiatorCapability:
-    token: bytes
-    private_capability: bytes
 
 
 class IdealPAKE:
@@ -152,16 +264,6 @@ class IdealPAKE:
         return record[1]
 
 
-@dataclass(frozen=True, repr=False)
-class _PublicKey:
-    capability: bytes
-
-
-@dataclass(frozen=True, repr=False)
-class _PrivateKey:
-    capability: bytes
-
-
 class IdealKEM:
     """Opaque ciphertext registry; c does not encode k or pk.
 
@@ -203,18 +305,6 @@ class IdealKEM:
         return record[1]
 
 
-@dataclass(frozen=True, repr=False)
-class ClientCredentials:
-    verifier: bytes
-    seed: bytes
-
-
-@dataclass(frozen=True, repr=False)
-class ServerCredentials:
-    verifier: bytes
-    registered_public_key: _PublicKey
-
-
 def register(kem: IdealKEM, password: bytes, salt: bytes,
              client_id: str, server_id: str
              ) -> Tuple[ClientCredentials, ServerCredentials]:
@@ -233,36 +323,7 @@ def register(kem: IdealKEM, password: bytes, salt: bytes,
             ServerCredentials(verifier, public))
 
 
-# ------------------------------------------------------------------------
-# 2. Messages and endpoint state machines
-# ------------------------------------------------------------------------
-
-class State(Enum):
-    INIT = "Init"
-    MSG1 = "Msg1 / CPace offer"
-    MSG2 = "Msg2 / CPace response"
-    OQUAKE_INIT = "OQUAKE initiation"
-    CONFIRMATION = "Confirmation / waiting for client"
-    ACCEPT = "Finished / Accept"
-    ABORT = "Abort"
-
-
-@dataclass(frozen=True)
-class Offer:
-    token: bytes
-
-
-@dataclass(frozen=True)
-class CPaceReply:
-    token: bytes
-
-
-@dataclass(frozen=True)
-class ConfirmationReply:
-    oquake_token: bytes
-    enc_c: bytes
-    client_confirm: bytes
-
+# Logging, observation, and test setup
 
 class Trace:
     def __init__(self, quiet: bool = False) -> None:
@@ -275,6 +336,34 @@ class Trace:
             print("  " + message)
 
 
+class Observer:
+    """Match earlier server responses to client acceptance; never decide Accept."""
+
+    def __init__(self) -> None:
+        self.__sequence = 0
+        self.__servers: List[Tuple[int, Witness]] = []
+        self.__clients: List[Tuple[int, Witness]] = []
+
+    def record(self, witness: Witness) -> None:
+        self.__sequence += 1
+        if witness.role == "server":
+            self.__servers.append((self.__sequence, witness))
+        else:
+            self.__clients.append((self.__sequence, witness))
+
+    def matching_servers(self, client_session: str) -> List[str]:
+        event = next(((sequence, w) for sequence, w in self.__clients
+                      if w.session == client_session), None)
+        if event is None:
+            return []
+        client_sequence, client = event
+        return [w.session for sequence, w in self.__servers
+                if sequence < client_sequence and client.matches(w)]
+
+    def accepted_clients(self) -> List[str]:
+        return [w.session for _, w in self.__clients]
+
+
 class Endpoint:
     def __init__(self, session: str, mode: str, lower: IdealPAKE,
                  kem: IdealKEM, observer: Observer, trace: Trace,
@@ -285,8 +374,7 @@ class Endpoint:
         self._lower, self._kem = lower, kem
         self._observer, self._trace = observer, trace
         self._identities = (client_id, server_id)
-        self._base_context = frame(client_id.encode(), server_id.encode(),
-                                   b"authentication-semantics experiment")
+        self._base_context = build_public_context(client_id, server_id)
         self._context = self._base_context
         self._wire: List[bytes] = []
         self._sk: Optional[bytes] = None
@@ -325,6 +413,66 @@ class Endpoint:
                        hashlib.sha256(DST + b"observer-key" + self.key).digest())
 
 
+@dataclass
+class Fixture:
+    """Fresh registration, ideal services, and observer for one test."""
+
+    mode: str
+    trace: Trace
+    lower: IdealPAKE = field(default_factory=IdealPAKE)
+    kem: IdealKEM = field(default_factory=IdealKEM)
+    observer: Observer = field(default_factory=Observer)
+
+    def __post_init__(self) -> None:
+        self.client_credentials, self.server_credentials = register(
+            self.kem, secrets.token_bytes(32), secrets.token_bytes(32),
+            "alice", "server.example")
+        self.public_context = build_public_context("alice", "server.example")
+
+    def client(self, label: str = "C1", mode: Optional[str] = None) -> Client:
+        return Client(self.client_credentials, session=label,
+                      mode=mode or self.mode, lower=self.lower, kem=self.kem,
+                      observer=self.observer, trace=self.trace)
+
+    def server(self, label: str = "S1", mode: Optional[str] = None) -> Server:
+        return Server(self.server_credentials, session=label,
+                      mode=mode or self.mode, lower=self.lower, kem=self.kem,
+                      observer=self.observer, trace=self.trace)
+
+    def attacker(self) -> AdversaryInterleaver:
+        return AdversaryInterleaver(self.server_credentials.verifier,
+                                   self.lower, self.trace)
+
+
+def ensure(condition: bool, description: str) -> None:
+    # Explicit checks remain active when Python is invoked with -O.
+    if not condition:
+        raise AssertionError(description)
+
+
+def check_verifier_only_knowledge(attacker: AdversaryInterleaver) -> None:
+    """Check declared knowledge; Python memory isolation is not modeled."""
+    forbidden = {"password", "seed", "pk_reg", "k_1", "final_key"}
+    ensure(not forbidden.intersection(attacker.knowledge),
+           "verifier-only actor must not gain the protected credentials/secrets")
+
+
+def summarize_result(client: Client, server: Server, observer: Observer,
+                     attacker: Optional[AdversaryInterleaver] = None) -> dict:
+    result = {
+        "client_state": client.state.value,
+        "server_state": server.state.value,
+        "matching_server_sessions": observer.matching_servers(client.session),
+    }
+    if attacker is not None:
+        result["attacker_knowledge_names"] = sorted(attacker.knowledge)
+    return result
+
+
+# ------------------------------------------------------------------------
+# 2. Endpoint processing and protocol interactions
+# ------------------------------------------------------------------------
+
 class Client(Endpoint):
     def __init__(self, credentials: ClientCredentials, **kwargs):
         super().__init__(**kwargs)
@@ -349,7 +497,8 @@ class Client(Endpoint):
         except AuthenticationError:
             self._reject("CPace response rejected")
         self._wire.append(reply.token)
-        self._context = frame(*self._wire) + self._base_context
+        self._context = bind_cpace_context(
+            self._base_context, self._wire[0], reply.token)
         self._move(State.MSG2, "complete ideal CPace shared-secret branch")
         self._oq_cap, token = self._lower.begin(
             b"OQUAKE", self._credentials.verifier, self._context, key1)
@@ -365,13 +514,12 @@ class Client(Endpoint):
         try:
             assert self._oq_cap is not None
             sk = self._lower.finish(self._oq_cap, reply.oquake_token)
-            ciphertext = xor(reply.enc_c, hkdf_expand(sk, DST + b"OTP", NCT))
+            ciphertext = unmask_ciphertext(sk, reply.enc_c)
             _, private = self._kem.derive_key_pair(self._credentials.seed)
             k = self._kem.decapsulate(private, ciphertext)
             expected = derive_client_confirmation(
                 self.mode, sk, self._context, reply.enc_c, k)
-            if not hmac.compare_digest(expected, reply.client_confirm):
-                raise AuthenticationError("client_confirm mismatch")
+            verify_confirmation(expected, reply.client_confirm, "client_confirm")
             server_confirm, key = derive_server_confirmation_and_key(
                 sk, self._context, reply.enc_c, k)
         except AuthenticationError as error:
@@ -402,7 +550,8 @@ class Server(Endpoint):
         except AuthenticationError:
             self._reject("CPace credential/context mismatch")
         self._wire.extend((offer.token, token))
-        self._context = frame(*self._wire) + self._base_context
+        self._context = bind_cpace_context(
+            self._base_context, offer.token, token)
         self._move(State.MSG2, "send CPace response")
         return CPaceReply(token)
 
@@ -418,7 +567,7 @@ class Server(Endpoint):
                 self._credentials.registered_public_key)
         except AuthenticationError:
             self._reject("OQUAKE or registered-key operation failed")
-        enc_c = xor(ciphertext, hkdf_expand(sk, DST + b"OTP", NCT))
+        enc_c = mask_ciphertext(sk, ciphertext)
         client_confirm = derive_client_confirmation(
             self.mode, sk, self._context, enc_c, k)
         self._server_confirm, self.key = derive_server_confirmation_and_key(
@@ -435,16 +584,15 @@ class Server(Endpoint):
         if not isinstance(server_confirm, bytes) or len(server_confirm) != NKC:
             self._reject("invalid server_confirm length/type")
         assert self._server_confirm is not None
-        if not hmac.compare_digest(self._server_confirm, server_confirm):
-            self._reject("server_confirm mismatch")
+        try:
+            verify_confirmation(self._server_confirm, server_confirm,
+                                "server_confirm")
+        except AuthenticationError as error:
+            self._reject(str(error))
         self._move(State.ACCEPT, "server_confirm verified; output final key")
         assert self.key is not None
         return self.key
 
-
-# ------------------------------------------------------------------------
-# 3. Two-session verifier-only interleaving
-# ------------------------------------------------------------------------
 
 class AdversaryInterleaver:
     """Verifier-only actor; never reads endpoint or primitive internals."""
@@ -462,15 +610,14 @@ class AdversaryInterleaver:
         msg1 = Offer(cpace_token)                 # A -> S1
         msg2 = server.respond_cpace(msg1)         # S1 -> A
         key1 = self.__lower.finish(cpace_state, msg2.token)
-        context1 = frame(msg1.token, msg2.token) + public_context
+        context1 = bind_cpace_context(public_context, msg1.token, msg2.token)
 
         oquake_state, oquake_token = self.__lower.begin(
             b"OQUAKE", self.__verifier, context1, key1)
         msg3 = Offer(oquake_token)                # A -> S1
         msg4 = server.respond_oquake(msg3)        # S1 -> A
         sk1 = self.__lower.finish(oquake_state, msg4.oquake_token)
-        pad1 = hkdf_expand(sk1, DST + b"OTP", NCT)
-        self.__ciphertext = xor(msg4.enc_c, pad1)
+        self.__ciphertext = unmask_ciphertext(sk1, msg4.enc_c)
         self.knowledge.update(("CPace_secret_1", "SK_1", "r_1", "c_1"))
         self.__trace.log("A / Session 1: knows SK_1 and r_1; recovers opaque c_1")
         self.__trace.log("A / Session 1: no seed, pk_reg, k_1, or final key")
@@ -482,7 +629,7 @@ class AdversaryInterleaver:
             b"CPace", self.__verifier, public_context, b"", msg1.token)
         msg2 = CPaceReply(cpace_token)            # A -> C2
         msg3 = client.receive_cpace(msg2)         # C2 -> A
-        context2 = frame(msg1.token, msg2.token) + public_context
+        context2 = bind_cpace_context(public_context, msg1.token, msg2.token)
         oquake_token, sk2 = self.__lower.respond(
             b"OQUAKE", self.__verifier, context2, key1, msg3.token)
         self.knowledge.update(("CPace_secret_2", "SK_2", "r_2"))
@@ -496,108 +643,13 @@ class AdversaryInterleaver:
             "A / Session 2: rewrap c_1 with r_2; recompute client_confirm")
         if client.mode == MODE_HARDENED:
             self.__trace.log("A / Session 2: k_1 unavailable; use fresh guessed k")
-        enc_c = xor(ciphertext, hkdf_expand(sk2, DST + b"OTP", NCT))
+        enc_c = mask_ciphertext(sk2, ciphertext)
         forged = derive_client_confirmation(
             client.mode, sk2, context2, enc_c, candidate_k)
         msg4 = ConfirmationReply(oquake_token, enc_c, forged)  # A -> C2
         msg5 = client.finish(msg4)                # C2 -> A, or authentication error
         self.knowledge.add("server_confirm_2")
         return msg5
-
-
-# ------------------------------------------------------------------------
-# 4. Matching-session observation and four comparison tests
-# ------------------------------------------------------------------------
-
-@dataclass(frozen=True, repr=False)
-class Witness:
-    """Honest execution metadata used only by the external test observer."""
-
-    session: str
-    role: str
-    identities: Tuple[str, str]
-    mode: str
-    context: bytes
-    transcript: bytes
-    lower_key_commitment: bytes
-    final_key_commitment: bytes
-
-    def matches(self, other: "Witness") -> bool:
-        return (self.role != other.role
-                and self.identities == other.identities
-                and self.mode == other.mode
-                and self.context == other.context
-                and self.transcript == other.transcript
-                and hmac.compare_digest(self.lower_key_commitment,
-                                        other.lower_key_commitment)
-                and hmac.compare_digest(self.final_key_commitment,
-                                        other.final_key_commitment))
-
-
-class Observer:
-    """Match earlier server responses to client acceptance; never decide Accept."""
-
-    def __init__(self) -> None:
-        self.__sequence = 0
-        self.__servers: List[Tuple[int, Witness]] = []
-        self.__clients: List[Tuple[int, Witness]] = []
-
-    def record(self, witness: Witness) -> None:
-        self.__sequence += 1
-        if witness.role == "server":
-            self.__servers.append((self.__sequence, witness))
-        else:
-            self.__clients.append((self.__sequence, witness))
-
-    def matching_servers(self, client_session: str) -> List[str]:
-        event = next(((sequence, w) for sequence, w in self.__clients
-                      if w.session == client_session), None)
-        if event is None:
-            return []
-        client_sequence, client = event
-        return [w.session for sequence, w in self.__servers
-                if sequence < client_sequence and client.matches(w)]
-
-    def accepted_clients(self) -> List[str]:
-        return [w.session for _, w in self.__clients]
-
-
-@dataclass
-class Fixture:
-    """Fresh registration, ideal services, and observer for one test."""
-
-    mode: str
-    trace: Trace
-    lower: IdealPAKE = field(default_factory=IdealPAKE)
-    kem: IdealKEM = field(default_factory=IdealKEM)
-    observer: Observer = field(default_factory=Observer)
-
-    def __post_init__(self) -> None:
-        self.client_credentials, self.server_credentials = register(
-            self.kem, secrets.token_bytes(32), secrets.token_bytes(32),
-            "alice", "server.example")
-        self.public_context = frame(b"alice", b"server.example",
-                                    b"authentication-semantics experiment")
-
-    def client(self, label: str = "C1", mode: Optional[str] = None) -> Client:
-        return Client(self.client_credentials, session=label,
-                      mode=mode or self.mode, lower=self.lower, kem=self.kem,
-                      observer=self.observer, trace=self.trace)
-
-    def server(self, label: str = "S1", mode: Optional[str] = None) -> Server:
-        return Server(self.server_credentials, session=label,
-                      mode=mode or self.mode, lower=self.lower, kem=self.kem,
-                      observer=self.observer, trace=self.trace)
-
-    def attacker(self) -> AdversaryInterleaver:
-        return AdversaryInterleaver(self.server_credentials.verifier,
-                                   self.lower, self.trace)
-
-
-def ensure(condition: bool, description: str) -> None:
-    # Explicit checks remain active when Python is invoked with -O.
-    if not condition:
-        raise AssertionError(description)
 
 
 def run_honest_handshake(client: Client, server: Server) -> None:
@@ -610,24 +662,18 @@ def run_honest_handshake(client: Client, server: Server) -> None:
     server.verify(msg5)
 
 
-def check_verifier_only_knowledge(attacker: AdversaryInterleaver) -> None:
-    """Check declared knowledge; Python memory isolation is not modeled."""
-    forbidden = {"password", "seed", "pk_reg", "k_1", "final_key"}
-    ensure(not forbidden.intersection(attacker.knowledge),
-           "verifier-only actor must not gain the protected credentials/secrets")
+def run_interleaving(client: Client, server: Server,
+                     attacker: AdversaryInterleaver, public_context: bytes
+                     ) -> None:
+    """Deliver the two-session translation; propagate client check failures."""
+    attacker.obtain_challenge(server, public_context)     # Session 1: A <-> S1
+    attacker.impersonate_server(client, public_context)   # Session 2: C2 <-> A
+    # Discard msg5_2; S1 remains waiting for its own final confirmation.
 
 
-def summarize_result(client: Client, server: Server, observer: Observer,
-                     attacker: Optional[AdversaryInterleaver] = None) -> dict:
-    result = {
-        "client_state": client.state.value,
-        "server_state": server.state.value,
-        "matching_server_sessions": observer.matching_servers(client.session),
-    }
-    if attacker is not None:
-        result["attacker_knowledge_names"] = sorted(attacker.knowledge)
-    return result
-
+# ------------------------------------------------------------------------
+# 3. Four comparison tests and command-line runner
+# ------------------------------------------------------------------------
 
 def test_baseline_honest(trace: Trace) -> dict:
     """Both baseline endpoints accept the same key in one matching session."""
@@ -652,9 +698,7 @@ def test_baseline_interleaving(trace: Trace) -> dict:
     client, server = experiment.client("C2"), experiment.server("S1")
     attacker = experiment.attacker()
 
-    attacker.obtain_challenge(server, experiment.public_context)  # Session 1
-    attacker.impersonate_server(client, experiment.public_context)  # Session 2
-    # Discard msg5_2; S1 remains waiting for its own final confirmation.
+    run_interleaving(client, server, attacker, experiment.public_context)
     ensure(client.state == State.ACCEPT,
            "baseline interleaving must reach Accept")
     ensure(experiment.observer.matching_servers(client.session) == [],
@@ -688,9 +732,8 @@ def test_hardened_interleaving(trace: Trace) -> dict:
     client, server = experiment.client("C2"), experiment.server("S1")
     attacker = experiment.attacker()
 
-    attacker.obtain_challenge(server, experiment.public_context)  # Session 1
     try:
-        attacker.impersonate_server(client, experiment.public_context)  # Session 2
+        run_interleaving(client, server, attacker, experiment.public_context)
     except AuthenticationError as error:
         ensure(str(error) == "client_confirm mismatch",
                "the interleaving must fail at the client confirmation check")
@@ -705,10 +748,6 @@ def test_hardened_interleaving(trace: Trace) -> dict:
     trace.log("Observer: guessed confirmation fails; no Client.Accept event")
     return summarize_result(client, server, experiment.observer, attacker)
 
-
-# ------------------------------------------------------------------------
-# 5. Command-line runner
-# ------------------------------------------------------------------------
 
 TESTS = (
     ("Test 1: Baseline honest handshake", test_baseline_honest),

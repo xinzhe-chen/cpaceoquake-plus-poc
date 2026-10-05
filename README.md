@@ -42,12 +42,18 @@ Both endpoints apply the same change:
 
 ## Read the code
 
-The single script has five numbered sections: confirmation formulas and
-ideal primitives; endpoint state machines; the two-session interleaver;
-the matching-session observer and four tests; and the command-line runner.
-Start with `test_baseline_interleaving` and `test_hardened_interleaving`
-for the before/after assertions. `run_honest_handshake` and the interleaver
-show individual messages as `msg1` through `msg5`.
+The single script has three numbered sections:
+
+1. **Shared definitions and operations**: data types, ideal PAKE/KEM,
+   confirmation formulas, ciphertext masking, context binding, and observation.
+2. **Endpoint processing and protocol interactions**: `Client`, `Server`,
+   the interleaver, `run_honest_handshake`, and `run_interleaving`.
+3. **Comparison tests and runner**: the four expected outcomes and CLI.
+
+To change the confirmation rule, edit `derive_client_confirmation` in
+section 1. To change endpoint handling or message delivery, edit section 2;
+messages are written explicitly as `msg1` through `msg5`. Section 3 checks
+the resulting behavior independently of those protocol operations.
 
 ## Model scope
 
